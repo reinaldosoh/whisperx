@@ -1,4 +1,5 @@
 # WhisperX CPU-only Dockerfile for EasyPanel
+# Versão simplificada sem diarização (pyannote-audio é muito pesado)
 FROM python:3.11-slim
 
 # Install system dependencies
@@ -11,47 +12,47 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Upgrade pip first
+# Upgrade pip
 RUN pip install --upgrade pip
 
-# Install PyTorch CPU-only first (smaller download, more stable)
+# Install PyTorch CPU-only (versão menor e mais estável)
 RUN pip install --no-cache-dir \
     torch==2.1.0+cpu \
     torchaudio==2.1.0+cpu \
     --index-url https://download.pytorch.org/whl/cpu
 
-# Install core dependencies in smaller batches
+# Install API dependencies
 RUN pip install --no-cache-dir \
-    fastapi \
-    uvicorn \
-    python-multipart \
-    numpy \
-    pandas
+    fastapi==0.109.0 \
+    uvicorn==0.27.0 \
+    python-multipart==0.0.6
 
-# Install whisper dependencies
+# Install data processing
 RUN pip install --no-cache-dir \
-    faster-whisper \
-    ctranslate2
+    numpy==1.26.3 \
+    pandas==2.1.4
 
-# Install alignment dependencies  
+# Install faster-whisper (core transcription)
 RUN pip install --no-cache-dir \
-    transformers \
-    nltk
+    faster-whisper==0.10.0 \
+    ctranslate2==4.0.0
 
-# Install whisperx (without deps since we installed them)
-RUN pip install --no-cache-dir whisperx --no-deps || \
-    pip install --no-cache-dir git+https://github.com/m-bain/whisperX.git --no-deps
-
-# Install remaining whisperx dependencies
+# Install transformers for alignment
 RUN pip install --no-cache-dir \
-    pyannote-audio \
-    huggingface-hub
+    transformers==4.36.2 \
+    huggingface-hub==0.20.2
 
-# Copy project files
+# Install nltk
+RUN pip install --no-cache-dir nltk==3.8.1
+
+# Copy API file
 COPY api.py .
 
-# Create directory for uploads
+# Create directories
 RUN mkdir -p /app/uploads /app/outputs
+
+# Download NLTK data
+RUN python -c "import nltk; nltk.download('punkt')"
 
 # Expose port
 EXPOSE 8000

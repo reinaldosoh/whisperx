@@ -1,27 +1,26 @@
 """
-WhisperX API Server for EasyPanel deployment (CPU-only)
+Whisper API Server for EasyPanel deployment (CPU-only)
+Uses faster-whisper for efficient transcription
 """
 import os
 import tempfile
 import uuid
-from pathlib import Path
 from typing import Optional
 
-import whisperx
+from faster_whisper import WhisperModel
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.responses import JSONResponse
 
 app = FastAPI(
-    title="WhisperX API",
-    description="Automatic Speech Recognition with Word-level Timestamps",
+    title="Whisper Transcription API",
+    description="Fast Speech Recognition API using faster-whisper (CPU-only)",
     version="1.0.0"
 )
 
 # Configuration for CPU-only mode
 DEVICE = "cpu"
 COMPUTE_TYPE = "int8"
-BATCH_SIZE = 4
-DEFAULT_MODEL = "base"  # Use smaller model for CPU: tiny, base, small, medium, large-v2
+DEFAULT_MODEL = "base"
 
 # Cache for loaded models
 model_cache = {}
@@ -31,9 +30,9 @@ def get_model(model_name: str = DEFAULT_MODEL):
     """Load and cache the whisper model"""
     if model_name not in model_cache:
         print(f"Loading model: {model_name}")
-        model_cache[model_name] = whisperx.load_model(
+        model_cache[model_name] = WhisperModel(
             model_name, 
-            DEVICE, 
+            device=DEVICE, 
             compute_type=COMPUTE_TYPE
         )
     return model_cache[model_name]
@@ -44,9 +43,10 @@ async def root():
     """Health check endpoint"""
     return {
         "status": "ok",
-        "service": "WhisperX API",
+        "service": "Whisper Transcription API",
         "device": DEVICE,
-        "compute_type": COMPUTE_TYPE
+        "compute_type": COMPUTE_TYPE,
+        "default_model": DEFAULT_MODEL
     }
 
 
@@ -61,102 +61,78 @@ async def transcribe(
     file: UploadFile = File(...),
     model: str = Form(default=DEFAULT_MODEL),
     language: Optional[str] = Form(default=None),
-    align: bool = Form(default=True),
-    diarize: bool = Form(default=False),
-    hf_token: Optional[str] = Form(default=None),
-    min_speakers: Optional[int] = Form(default=None),
-    max_speakers: Optional[int] = Form(default=None),
+    task: str = Form(default="transcribe"),
 ):
     """
     Transcribe an audio file
     
     Parameters:
     - file: Audio file (mp3, wav, m4a, etc.)
-    - model: Whisper model size (tiny, base, small, medium, large-v2)
+    - model: Whisper model size (tiny, base, small, medium, large-v2, large-v3)
     - language: Language code (e.g., 'en', 'pt', 'es'). Auto-detect if not provided.
-    - align: Enable word-level alignment (default: True)
-    - diarize: Enable speaker diarization (requires hf_token)
-    - hf_token: HuggingFace token for diarization
-    - min_speakers: Minimum number of speakers (for diarization)
-    - max_speakers: Maximum number of speakers (for diarization)
+    - task: 'transcribe' or 'translate' (translate to English)
     """
     
-    # Validate file
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
     
-    # Save uploaded file temporarily
     temp_dir = tempfile.mkdtemp()
     temp_path = os.path.join(temp_dir, f"{uuid.uuid4()}_{file.filename}")
     
     try:
-        # Write file to disk
         content = await file.read()
         with open(temp_path, "wb") as f:
             f.write(content)
         
-        # Load model
         whisper_model = get_model(model)
         
-        # Load audio
-        audio = whisperx.load_audio(temp_path)
-        
-        # Transcribe
-        result = whisper_model.transcribe(
-            audio, 
-            batch_size=BATCH_SIZE,
-            language=language
+        segments, info = whisper_model.transcribe(
+            temp_path,
+            language=language,
+            task=task,
+            beam_size=5,
+            word_timestamps=True,
+            vad_filter=True,
         )
         
-        # Align (word-level timestamps)
-        if align and result.get("segments"):
-            try:
-                model_a, metadata = whisperx.load_align_model(
-                    language_code=result["language"], 
-                    device=DEVICE
-                )
-                result = whisperx.align(
-                    result["segments"], 
-                    model_a, 
-                    metadata, 
-                    audio, 
-                    DEVICE, 
-                    return_char_alignments=False
-                )
-            except Exception as e:
-                print(f"Alignment failed: {e}")
-                # Continue without alignment
+        result_segments = []
+        full_text = ""
         
-        # Diarize (speaker identification)
-        if diarize and hf_token:
-            try:
-                from whisperx.diarize import DiarizationPipeline
-                diarize_model = DiarizationPipeline(
-                    use_auth_token=hf_token, 
-                    device=DEVICE
-                )
-                diarize_segments = diarize_model(
-                    audio,
-                    min_speakers=min_speakers,
-                    max_speakers=max_speakers
-                )
-                result = whisperx.assign_word_speakers(diarize_segments, result)
-            except Exception as e:
-                print(f"Diarization failed: {e}")
-                # Continue without diarization
+        for segment in segments:
+            seg_data = {
+                "id": segment.id,
+                "start": round(segment.start, 2),
+                "end": round(segment.end, 2),
+                "text": segment.text.strip(),
+            }
+            
+            if segment.words:
+                seg_data["words"] = [
+                    {
+                        "word": word.word,
+                        "start": round(word.start, 2),
+                        "end": round(word.end, 2),
+                        "probability": round(word.probability, 3)
+                    }
+                    for word in segment.words
+                ]
+            
+            result_segments.append(seg_data)
+            full_text += segment.text
         
         return JSONResponse(content={
             "success": True,
-            "language": result.get("language"),
-            "segments": result.get("segments", []),
-            "word_segments": result.get("word_segments", [])
+            "language": info.language,
+            "language_probability": round(info.language_probability, 3),
+            "duration": round(info.duration, 2),
+            "text": full_text.strip(),
+            "segments": result_segments,
         })
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
     finally:
-        # Cleanup temp file
         if os.path.exists(temp_path):
             os.remove(temp_path)
         if os.path.exists(temp_dir):
@@ -168,14 +144,15 @@ async def list_models():
     """List available Whisper models"""
     return {
         "models": [
-            {"name": "tiny", "description": "Fastest, lowest accuracy", "vram": "~1GB"},
-            {"name": "base", "description": "Fast, good for simple audio", "vram": "~1GB"},
-            {"name": "small", "description": "Balanced speed/accuracy", "vram": "~2GB"},
-            {"name": "medium", "description": "Good accuracy", "vram": "~5GB"},
-            {"name": "large-v2", "description": "Best accuracy, slowest", "vram": "~10GB"},
-            {"name": "large-v3", "description": "Latest, best accuracy", "vram": "~10GB"},
+            {"name": "tiny", "params": "39M", "description": "Fastest, lowest accuracy"},
+            {"name": "base", "params": "74M", "description": "Fast, good for simple audio"},
+            {"name": "small", "params": "244M", "description": "Balanced speed/accuracy"},
+            {"name": "medium", "params": "769M", "description": "Good accuracy"},
+            {"name": "large-v2", "params": "1550M", "description": "Best accuracy"},
+            {"name": "large-v3", "params": "1550M", "description": "Latest, best accuracy"},
         ],
-        "recommended_for_cpu": "base or small"
+        "recommended_for_cpu": "base or small",
+        "note": "Models are downloaded on first use"
     }
 
 
